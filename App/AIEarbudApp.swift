@@ -18,10 +18,12 @@ final class Assistant: NSObject, ObservableObject {
     @Published var status = "Tap Start, then press an AirPod stem once to ask."
     @Published var running = false
     @Published var listening = false
+    @Published var lastPress = "none yet"
+    @Published var pressCount = 0
 
     private let model = "gemini-3.5-flash-lite"
     private let synth = AVSpeechSynthesizer()
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var player: AVAudioPlayer?
     private var recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
@@ -30,6 +32,8 @@ final class Assistant: NSObject, ObservableObject {
     private var latestText = ""
     private var history: [[String: Any]] = []
     private var remoteTokens: [(MPRemoteCommand, Any)] = []
+    private var starting = false
+    private var thinking = false
 
     override init() {
         let d = UserDefaults.standard
@@ -61,16 +65,20 @@ final class Assistant: NSObject, ObservableObject {
         }
     }
 
-    private func activate() {
-        guard !running else { return }
+    private func setPlaybackMode() {
         do {
             let s = AVAudioSession.sharedInstance()
-            try s.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
+            try s.setCategory(.playback, mode: .default, options: [])
             try s.setActive(true)
         } catch {
             status = "Audio error: \(error.localizedDescription)"
-            return
         }
+        if let p = player, !p.isPlaying { p.play() }
+    }
+
+    private func activate() {
+        guard !running else { return }
+        setPlaybackMode()
         startSilentPlayer()
         setupRemote()
         UIApplication.shared.beginReceivingRemoteControlEvents()
@@ -83,14 +91,16 @@ final class Assistant: NSObject, ObservableObject {
     }
 
     func stop() {
+        silenceTimer?.invalidate()
         if listening {
-            silenceTimer?.invalidate()
             listening = false
             engine.stop()
             engine.inputNode.removeTap(onBus: 0)
             request?.endAudio()
             task?.cancel()
         }
+        starting = false
+        thinking = false
         synth.stopSpeaking(at: .immediate)
         player?.stop()
         player = nil
@@ -137,13 +147,23 @@ final class Assistant: NSObject, ObservableObject {
 
     private func setupRemote() {
         let c = MPRemoteCommandCenter.shared()
-        let all: [MPRemoteCommand] = [c.playCommand, c.pauseCommand, c.togglePlayPauseCommand,
-                                      c.nextTrackCommand, c.previousTrackCommand]
+        let all: [(MPRemoteCommand, String)] = [
+            (c.playCommand, "play"),
+            (c.pauseCommand, "pause"),
+            (c.togglePlayPauseCommand, "toggle play/pause"),
+            (c.nextTrackCommand, "next track"),
+            (c.previousTrackCommand, "previous track")
+        ]
         remoteTokens = []
-        for cmd in all {
+        for (cmd, name) in all {
             cmd.isEnabled = true
             let token = cmd.addTarget { [weak self] _ in
-                DispatchQueue.main.async { self?.trigger() }
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.pressCount += 1
+                    self.lastPress = "\(name) #\(self.pressCount)"
+                    self.trigger()
+                }
                 return .success
             }
             remoteTokens.append((cmd, token))
@@ -180,6 +200,7 @@ final class Assistant: NSObject, ObservableObject {
     // MARK: Ask
 
     func trigger() {
+        if starting || thinking { return }
         if synth.isSpeaking {
             synth.stopSpeaking(at: .immediate)
             return
@@ -202,17 +223,38 @@ final class Assistant: NSObject, ObservableObject {
         }
         recognizer = rec
         latestText = ""
+        starting = true
+        status = "Starting microphone..."
+        do {
+            let s = AVAudioSession.sharedInstance()
+            try s.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
+            try s.setActive(true)
+        } catch {
+            starting = false
+            status = "Audio error: \(error.localizedDescription)"
+            setPlaybackMode()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.beginCapture(with: rec)
+        }
+    }
+
+    private func beginCapture(with rec: SFSpeechRecognizer) {
+        starting = false
+        guard running else { return }
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         request = req
 
+        engine = AVAudioEngine()
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0 else {
-            status = "Microphone not ready. Try again."
+            status = "Microphone not ready. Press again."
+            setPlaybackMode()
             return
         }
-        input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
             req.append(buffer)
         }
@@ -221,6 +263,8 @@ final class Assistant: NSObject, ObservableObject {
             try engine.start()
         } catch {
             status = "Mic error: \(error.localizedDescription)"
+            input.removeTap(onBus: 0)
+            setPlaybackMode()
             return
         }
         listening = true
@@ -254,6 +298,7 @@ final class Assistant: NSObject, ObservableObject {
         task?.cancel()
         task = nil
         request = nil
+        setPlaybackMode()
         let q = latestText.trimmingCharacters(in: .whitespacesAndNewlines)
         if q.isEmpty {
             status = "Did not hear anything. Press again to ask."
@@ -261,6 +306,7 @@ final class Assistant: NSObject, ObservableObject {
         }
         status = "Thinking..."
         answer = "..."
+        thinking = true
         Task { await respond(q) }
     }
 
@@ -268,12 +314,14 @@ final class Assistant: NSObject, ObservableObject {
         do {
             let text = try await callGemini(question)
             await MainActor.run {
+                self.thinking = false
                 self.answer = text
                 self.status = "Ready. Press an AirPod stem once to ask."
                 self.speak(text)
             }
         } catch {
             await MainActor.run {
+                self.thinking = false
                 self.answer = ""
                 self.status = "Error: \(error.localizedDescription)"
             }
@@ -364,6 +412,10 @@ struct ContentView: View {
                 Text(a.listening ? "Listening..." : a.status)
                     .font(.footnote)
                     .foregroundColor(.gray)
+
+                Text("Last button press: \(a.lastPress)")
+                    .font(.footnote)
+                    .foregroundColor(.orange)
 
                 Text("You said:").font(.caption).foregroundColor(.gray)
                 Text(a.heard.isEmpty ? " " : a.heard)
