@@ -6,9 +6,6 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-    defaults:
-      run:
-        working-directory: Sources
     steps:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
@@ -28,4 +25,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AIEarbud-ipa
-          path: Sources/AIEarbud.ipa
+          path: AIEarbud.ipa
