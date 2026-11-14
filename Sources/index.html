@@ -35,7 +35,7 @@
 
 <script>
 // If you get a "model not found" error, try 'llama-3.1-8b-instant' here instead
-const MODEL = 'openai/gpt-oss-20b';
+const MODEL = 'groq/compound';
 
 const $ = id => document.getElementById(id);
 const keyInput = $('key'), langSel = $('lang'), modeSel = $('mode'), talk = $('talk');
@@ -68,7 +68,7 @@ async function ask(question) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 2000,       reasoning_effort: 'low',
+      max_tokens: 2000, 
       messages: [{ role: 'system', content: system }, ...history, { role: 'user', content: question }]
     })
   });
