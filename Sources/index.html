@@ -73,7 +73,6 @@ async function ask(question) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
         contents,
-        tools: [{ google_search: {} }],
         generationConfig: { maxOutputTokens: 1000 }
       })
     }
