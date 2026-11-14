@@ -35,7 +35,7 @@
 
 <script>
 // If you get a "model not found" error, try 'llama-3.1-8b-instant' here instead
-const MODEL = 'groq/compound';
+const MODEL = 'openai/gpt-oss-20b';
 
 const $ = id => document.getElementById(id);
 const keyInput = $('key'), langSel = $('lang'), modeSel = $('mode'), talk = $('talk');
@@ -57,9 +57,10 @@ function say(text) {
 }
 
 async function ask(question) {
-  const system = modeSel.value === 'short'
+    const honesty = " You have no internet access and no clock, so you cannot know live information like today's weather, news, prices, sports scores or the current time. If asked, say plainly that you can't check that live and suggest looking it up. Never guess or invent facts. If you are unsure, say so.";
+  const system = (modeSel.value === 'short'
     ? "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown. Reply in the language the user speaks."
-    : "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, because your answer is read aloud. Reply in the language the user speaks.";
+    : "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, because your answer is read aloud. Reply in the language the user speaks.") + honesty;
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -69,6 +70,7 @@ async function ask(question) {
     body: JSON.stringify({
       model: MODEL,
       max_tokens: 2000, 
+      reasoning_effort: 'low',
       messages: [{ role: 'system', content: system }, ...history, { role: 'user', content: question }]
     })
   });
