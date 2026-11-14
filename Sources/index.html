@@ -16,7 +16,7 @@
 <body>
 <h2>AI Earbud (test)</h2>
 
-<input id="key" type="password" placeholder="Paste API key here (saved on this device only)">
+<input id="key" type="password" placeholder="Paste Groq API key here (saved on this device only)">
 <select id="lang">
   <option value="en-US">English</option>
   <option value="ru-RU">Русский</option>
@@ -34,11 +34,14 @@
 <div class="box" id="status"></div>
 
 <script>
+// If you get a "model not found" error, try 'llama-3.1-8b-instant' here instead
+const MODEL = 'llama-3.3-70b-versatile';
+
 const $ = id => document.getElementById(id);
 const keyInput = $('key'), langSel = $('lang'), modeSel = $('mode'), talk = $('talk');
 
 // remember settings on this device only
-for (const [el, name] of [[keyInput, 'key'], [langSel, 'lang'], [modeSel, 'mode']]) {
+for (const [el, name] of [[keyInput, 'groqkey'], [langSel, 'lang'], [modeSel, 'mode']]) {
   try { el.value = localStorage.getItem(name) || el.value; } catch (e) {}
   el.addEventListener('input', () => { try { localStorage.setItem(name, el.value); } catch (e) {} });
 }
@@ -57,24 +60,21 @@ async function ask(question) {
   const system = modeSel.value === 'short'
     ? "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown. Reply in the language the user speaks."
     : "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, because your answer is read aloud. Reply in the language the user speaks.";
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': keyInput.value.trim(),
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
+      'authorization': 'Bearer ' + keyInput.value.trim()
     },
     body: JSON.stringify({
-      model: 'claude-haiku-5-5',
+      model: MODEL,
       max_tokens: 600,
-      system,
-      messages: [...history, { role: 'user', content: question }]
+      messages: [{ role: 'system', content: system }, ...history, { role: 'user', content: question }]
     })
   });
   const data = await res.json();
   if (!res.ok) throw new Error((data.error && data.error.message) || 'Request failed');
-  const answer = data.content.filter(b => b.type === 'text').map(b => b.text).join(' ');
+  const answer = ((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '(no answer)').trim();
   history.push({ role: 'user', content: question }, { role: 'assistant', content: answer });
   if (history.length > 12) history.splice(0, 2);
   return answer;
