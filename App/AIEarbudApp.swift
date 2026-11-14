@@ -13,6 +13,7 @@ final class Assistant: NSObject, ObservableObject {
     @Published var apiKey: String { didSet { UserDefaults.standard.set(apiKey, forKey: "gkey") } }
     @Published var langCode: String { didSet { UserDefaults.standard.set(langCode, forKey: "lang") } }
     @Published var shortMode: Bool { didSet { UserDefaults.standard.set(shortMode, forKey: "short") } }
+    @Published var keepMic: Bool { didSet { UserDefaults.standard.set(keepMic, forKey: "keepmic") } }
     @Published var heard = ""
     @Published var answer = ""
     @Published var status = "Tap Start, then press an AirPod stem once to ask."
@@ -35,12 +36,29 @@ final class Assistant: NSObject, ObservableObject {
     private var starting = false
     private var thinking = false
 
+    // The audio thread reads this, so access goes through a lock.
+    private let lock = NSLock()
+    private var liveRequest: SFSpeechAudioBufferRecognitionRequest?
+
     override init() {
         let d = UserDefaults.standard
         apiKey = d.string(forKey: "gkey") ?? ""
         langCode = d.string(forKey: "lang") ?? "en-US"
         shortMode = d.object(forKey: "short") as? Bool ?? true
+        keepMic = d.object(forKey: "keepmic") as? Bool ?? true
         super.init()
+    }
+
+    private func setCurrentRequest(_ r: SFSpeechAudioBufferRecognitionRequest?) {
+        lock.lock()
+        liveRequest = r
+        lock.unlock()
+    }
+
+    private func currentRequest() -> SFSpeechAudioBufferRecognitionRequest? {
+        lock.lock()
+        defer { lock.unlock() }
+        return liveRequest
     }
 
     // MARK: Start / stop
@@ -76,9 +94,20 @@ final class Assistant: NSObject, ObservableObject {
         if let p = player, !p.isPlaying { p.play() }
     }
 
+    private func setCaptureMode() {
+        do {
+            let s = AVAudioSession.sharedInstance()
+            try s.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
+            try s.setActive(true)
+        } catch {
+            status = "Audio error: \(error.localizedDescription)"
+        }
+        if let p = player, !p.isPlaying { p.play() }
+    }
+
     private func activate() {
         guard !running else { return }
-        setPlaybackMode()
+        if keepMic { setCaptureMode() } else { setPlaybackMode() }
         startSilentPlayer()
         setupRemote()
         UIApplication.shared.beginReceivingRemoteControlEvents()
@@ -86,19 +115,31 @@ final class Assistant: NSObject, ObservableObject {
                                                name: AVAudioSession.interruptionNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(routeChanged(_:)),
                                                name: AVAudioSession.routeChangeNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(engineConfigChanged(_:)),
+                                               name: .AVAudioEngineConfigurationChange, object: nil)
         running = true
-        status = "Ready. Press an AirPod stem once to ask."
+        if keepMic {
+            status = "Starting microphone..."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self = self, self.running else { return }
+                if self.startEngine() {
+                    self.status = "Ready (mic on, screen lock OK). Press an AirPod stem once to ask."
+                }
+            }
+        } else {
+            status = "Ready. Press an AirPod stem once to ask."
+        }
     }
 
     func stop() {
         silenceTimer?.invalidate()
+        setCurrentRequest(nil)
         if listening {
             listening = false
-            engine.stop()
-            engine.inputNode.removeTap(onBus: 0)
             request?.endAudio()
             task?.cancel()
         }
+        if engine.isRunning { stopEngine() }
         starting = false
         thinking = false
         synth.stopSpeaking(at: .immediate)
@@ -115,6 +156,45 @@ final class Assistant: NSObject, ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         running = false
         status = "Stopped."
+    }
+
+    // MARK: Microphone engine
+
+    private func startEngine() -> Bool {
+        engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0 else {
+            status = "Microphone not ready. Tap Stop, then Start again."
+            return false
+        }
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            // Audio is only used while a question is being asked. Otherwise it is dropped.
+            self?.currentRequest()?.append(buffer)
+        }
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            status = "Mic error: \(error.localizedDescription)"
+            input.removeTap(onBus: 0)
+            return false
+        }
+        return true
+    }
+
+    private func stopEngine() {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+    }
+
+    @objc private func engineConfigChanged(_ n: Notification) {
+        DispatchQueue.main.async {
+            guard self.running, self.keepMic, !self.engine.isRunning else { return }
+            if self.startEngine() {
+                self.status = "Microphone restarted. Press an AirPod stem once to ask."
+            }
+        }
     }
 
     // MARK: Keep-alive sound and AirPods button
@@ -178,8 +258,15 @@ final class Assistant: NSObject, ObservableObject {
         guard let v = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let t = AVAudioSession.InterruptionType(rawValue: v) else { return }
         if t == .ended {
-            try? AVAudioSession.sharedInstance().setActive(true)
-            player?.play()
+            DispatchQueue.main.async {
+                guard self.running else { return }
+                if self.keepMic { self.setCaptureMode() } else { self.setPlaybackMode() }
+                if self.keepMic && !self.engine.isRunning {
+                    if self.startEngine() {
+                        self.status = "Microphone restarted. Press an AirPod stem once to ask."
+                    }
+                }
+            }
         }
     }
 
@@ -223,54 +310,50 @@ final class Assistant: NSObject, ObservableObject {
         }
         recognizer = rec
         latestText = ""
-        starting = true
-        status = "Starting microphone..."
-        do {
-            let s = AVAudioSession.sharedInstance()
-            try s.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
-            try s.setActive(true)
-        } catch {
-            starting = false
-            status = "Audio error: \(error.localizedDescription)"
-            setPlaybackMode()
+
+        if keepMic {
+            guard engine.isRunning else {
+                status = "Microphone is not running. Open the app, tap Stop, then Start."
+                return
+            }
+            let req = makeRequest()
+            beginRecognition(with: rec, req: req)
             return
         }
+
+        starting = true
+        status = "Starting microphone..."
+        setCaptureMode()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.beginCapture(with: rec)
         }
     }
 
-    private func beginCapture(with rec: SFSpeechRecognizer) {
-        starting = false
-        guard running else { return }
+    private func makeRequest() -> SFSpeechAudioBufferRecognitionRequest {
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         request = req
+        setCurrentRequest(req)
+        return req
+    }
 
-        engine = AVAudioEngine()
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0 else {
-            status = "Microphone not ready. Press again."
+    private func beginCapture(with rec: SFSpeechRecognizer) {
+        starting = false
+        guard running else { return }
+        let req = makeRequest()
+        if !startEngine() {
+            setCurrentRequest(nil)
+            request = nil
             setPlaybackMode()
             return
         }
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            req.append(buffer)
-        }
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            status = "Mic error: \(error.localizedDescription)"
-            input.removeTap(onBus: 0)
-            setPlaybackMode()
-            return
-        }
+        beginRecognition(with: rec, req: req)
+    }
+
+    private func beginRecognition(with rec: SFSpeechRecognizer, req: SFSpeechAudioBufferRecognitionRequest) {
         listening = true
         status = "Listening..."
         armTimer(seconds: 5)
-
         task = rec.recognitionTask(with: req) { [weak self] result, _ in
             DispatchQueue.main.async {
                 guard let self = self, self.listening, let r = result else { return }
@@ -292,13 +375,15 @@ final class Assistant: NSObject, ObservableObject {
         silenceTimer?.invalidate()
         guard listening else { return }
         listening = false
-        engine.stop()
-        engine.inputNode.removeTap(onBus: 0)
+        setCurrentRequest(nil)
         request?.endAudio()
         task?.cancel()
         task = nil
         request = nil
-        setPlaybackMode()
+        if !keepMic {
+            stopEngine()
+            setPlaybackMode()
+        }
         let q = latestText.trimmingCharacters(in: .whitespacesAndNewlines)
         if q.isEmpty {
             status = "Did not hear anything. Press again to ask."
@@ -397,6 +482,9 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
 
                 Toggle("Short answers (in a conversation)", isOn: $a.shortMode)
+
+                Toggle("Keep mic ready (works with screen locked)", isOn: $a.keepMic)
+                    .disabled(a.running)
 
                 Button(a.running ? "Stop" : "Start") {
                     if a.running { a.stop() } else { a.start() }
