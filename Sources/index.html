@@ -34,7 +34,7 @@
 <div class="box" id="status"></div>
 
 <script>
-// If you get a "model not found" error, try 'gemini-3.5-flash' here instead
+// If you get a "model not found" error, change this to 'gemini-3.1-flash-lite'
 const MODEL = 'gemini-3.5-flash-lite';
 
 const $ = id => document.getElementById(id);
@@ -57,9 +57,10 @@ function say(text) {
 }
 
 async function ask(question) {
-    const extra = " Today is " + new Date().toLocaleString() + ". You have no internet access, so you cannot know live information like weather, news, prices or scores. If asked, say plainly that you can't check that live. Never invent facts. If you are unsure, say so.";
-    ? "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown, no links. Reply in the language the user speaks."
-    : "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, no links, because your answer is read aloud. Reply in the language the user speaks.") + extra;
+  const extra = " Today is " + new Date().toLocaleString() + ". You have no internet access, so you cannot know live information like weather, news, prices or scores. If asked, say plainly that you can't check that live. Never invent facts. If you are unsure, say so.";
+  const shortStyle = "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown, no links. Reply in the language the user speaks.";
+  const fullStyle = "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, no links, because your answer is read aloud. Reply in the language the user speaks.";
+  const system = (modeSel.value === 'short' ? shortStyle : fullStyle) + extra;
   const contents = [...history, { role: 'user', parts: [{ text: question }] }];
   const res = await fetch(
     'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL + ':generateContent',
