@@ -13,7 +13,7 @@ final class Assistant: NSObject, ObservableObject {
     @Published var apiKey: String { didSet { UserDefaults.standard.set(apiKey, forKey: "gkey") } }
     @Published var langCode: String { didSet { UserDefaults.standard.set(langCode, forKey: "lang") } }
     @Published var shortMode: Bool { didSet { UserDefaults.standard.set(shortMode, forKey: "short") } }
-    @Published var keepMic: Bool { didSet { UserDefaults.standard.set(keepMic, forKey: "keepmic") } }
+    @Published var mode: Int { didSet { UserDefaults.standard.set(mode, forKey: "mode") } }
     @Published var heard = ""
     @Published var answer = ""
     @Published var status = "Tap Start, then press an AirPod stem once to ask."
@@ -40,12 +40,17 @@ final class Assistant: NSObject, ObservableObject {
     private let lock = NSLock()
     private var liveRequest: SFSpeechAudioBufferRecognitionRequest?
 
+    // mode 0 = always-on mic using the iPhone mic, 1 = always-on mic using the AirPods mic,
+    // 2 = mic only while a question is being asked (AirPods mic)
+    private var keepMic: Bool { mode != 2 }
+    private var phoneMic: Bool { mode == 0 }
+
     override init() {
         let d = UserDefaults.standard
         apiKey = d.string(forKey: "gkey") ?? ""
         langCode = d.string(forKey: "lang") ?? "en-US"
         shortMode = d.object(forKey: "short") as? Bool ?? true
-        keepMic = d.object(forKey: "keepmic") as? Bool ?? true
+        mode = d.object(forKey: "mode") as? Int ?? 0
         super.init()
     }
 
@@ -97,8 +102,14 @@ final class Assistant: NSObject, ObservableObject {
     private func setCaptureMode() {
         do {
             let s = AVAudioSession.sharedInstance()
-            try s.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
+            let options: AVAudioSession.CategoryOptions = phoneMic
+                ? [.allowBluetoothA2DP]
+                : [.allowBluetooth, .allowBluetoothA2DP]
+            try s.setCategory(.playAndRecord, mode: .default, options: options)
             try s.setActive(true)
+            if phoneMic, let builtIn = s.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                try? s.setPreferredInput(builtIn)
+            }
         } catch {
             status = "Audio error: \(error.localizedDescription)"
         }
@@ -123,7 +134,8 @@ final class Assistant: NSObject, ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 guard let self = self, self.running else { return }
                 if self.startEngine() {
-                    self.status = "Ready (mic on, screen lock OK). Press an AirPod stem once to ask."
+                    let which = self.phoneMic ? "iPhone mic" : "AirPods mic"
+                    self.status = "Ready (\(which) on, screen lock OK). Press an AirPod stem once to ask."
                 }
             }
         } else {
@@ -483,8 +495,14 @@ struct ContentView: View {
 
                 Toggle("Short answers (in a conversation)", isOn: $a.shortMode)
 
-                Toggle("Keep mic ready (works with screen locked)", isOn: $a.keepMic)
-                    .disabled(a.running)
+                Text("Mode (change before Start):").font(.caption).foregroundColor(.gray)
+                Picker("Mode", selection: $a.mode) {
+                    Text("Always-on, iPhone mic (stem may work)").tag(0)
+                    Text("Always-on, AirPods mic (stem gives tone)").tag(1)
+                    Text("Mic only on press, AirPods mic (screen on)").tag(2)
+                }
+                .pickerStyle(.menu)
+                .disabled(a.running)
 
                 Button(a.running ? "Stop" : "Start") {
                     if a.running { a.stop() } else { a.start() }
