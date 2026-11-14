@@ -35,7 +35,7 @@
 
 <script>
 // If you get a "model not found" error, try 'gemini-3.5-flash' here instead
-const MODEL = 'gemini-3.8-flash';
+const MODEL = 'gemini-3.5-flash-lite';
 
 const $ = id => document.getElementById(id);
 const keyInput = $('key'), langSel = $('lang'), modeSel = $('mode'), talk = $('talk');
@@ -57,8 +57,7 @@ function say(text) {
 }
 
 async function ask(question) {
-  const extra = " Today is " + new Date().toLocaleString() + ". You can search the web, so use it for live facts like weather, news, prices, scores and the current time. If you cannot find something or are unsure, say so plainly. Never invent facts.";
-  const system = (modeSel.value === 'short'
+    const extra = " Today is " + new Date().toLocaleString() + ". You have no internet access, so you cannot know live information like weather, news, prices or scores. If asked, say plainly that you can't check that live. Never invent facts. If you are unsure, say so.";
     ? "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown, no links. Reply in the language the user speaks."
     : "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, no links, because your answer is read aloud. Reply in the language the user speaks.") + extra;
   const contents = [...history, { role: 'user', parts: [{ text: question }] }];
