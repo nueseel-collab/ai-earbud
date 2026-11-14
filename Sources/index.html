@@ -8,6 +8,7 @@
   body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 0 auto; padding: 16px; background: #111; color: #eee; }
   button { font-size: 20px; padding: 18px; width: 100%; border-radius: 14px; border: 0; background: #3b82f6; color: #fff; margin: 12px 0; }
   button.listening { background: #ef4444; }
+  button.on { background: #16a34a; }
   select, input { width: 100%; padding: 10px; font-size: 16px; margin: 6px 0; border-radius: 8px; border: 1px solid #444; background: #222; color: #eee; box-sizing: border-box; }
   .box { background: #1d1d1d; border-radius: 10px; padding: 12px; margin: 8px 0; min-height: 24px; white-space: pre-wrap; }
   small { color: #888; }
@@ -27,6 +28,7 @@
   <option value="full">Full answers (when alone)</option>
 </select>
 
+<button id="enable">Turn on AirPods click</button>
 <button id="talk">Tap and ask</button>
 
 <small>You said:</small><div class="box" id="heard"></div>
@@ -38,7 +40,7 @@
 const MODEL = 'gemini-3.5-flash-lite';
 
 const $ = id => document.getElementById(id);
-const keyInput = $('key'), langSel = $('lang'), modeSel = $('mode'), talk = $('talk');
+const keyInput = $('key'), langSel = $('lang'), modeSel = $('mode'), talk = $('talk'), enableBtn = $('enable');
 
 // remember settings on this device only
 for (const [el, name] of [[keyInput, 'gkey'], [langSel, 'lang'], [modeSel, 'mode']]) {
@@ -48,6 +50,7 @@ for (const [el, name] of [[keyInput, 'gkey'], [langSel, 'lang'], [modeSel, 'mode
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const history = [];
+let listening = false;
 
 function say(text) {
   speechSynthesis.cancel();
@@ -57,10 +60,10 @@ function say(text) {
 }
 
 async function ask(question) {
-  const extra = " Today is " + new Date().toLocaleString() + ". You have no internet access, so you cannot know live information like weather, news, prices or scores. If asked, say plainly that you can't check that live. Never invent facts. If you are unsure, say so.";
+  const rules = " Rules: (1) When asked what a word or thing means, start with the plain dictionary-style meaning, then add a short example only if it helps. (2) The user's text comes from speech recognition and can contain mishearings. If a phrase looks odd or does not make sense, say you may have misheard and ask them to repeat, instead of guessing. (3) If the user states something that is wrong, politely correct it. Never agree just to be agreeable, and never open with praise like 'spot on' or 'great question'. (4) You have no internet access, so you cannot know live information like weather, news, prices or scores. If asked, say plainly that you can't check that live. (5) Never invent facts. If you are not sure, say so. Today is " + new Date().toLocaleString() + ".";
   const shortStyle = "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown, no links. Reply in the language the user speaks.";
   const fullStyle = "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, no links, because your answer is read aloud. Reply in the language the user speaks.";
-  const system = (modeSel.value === 'short' ? shortStyle : fullStyle) + extra;
+  const system = (modeSel.value === 'short' ? shortStyle : fullStyle) + rules;
   const contents = [...history, { role: 'user', parts: [{ text: question }] }];
   const res = await fetch(
     'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL + ':generateContent',
@@ -73,7 +76,7 @@ async function ask(question) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
         contents,
-        generationConfig: { maxOutputTokens: 1000 }
+        generationConfig: { maxOutputTokens: 1000, temperature: 0.3 }
       })
     }
   );
@@ -86,22 +89,19 @@ async function ask(question) {
   return answer;
 }
 
-talk.addEventListener('click', () => {
+function startAsk() {
+  if (listening) return;
   if (!SR) { $('status').textContent = 'No speech recognition here. Use Safari on iPhone or Chrome on PC.'; return; }
   if (!keyInput.value.trim()) { $('status').textContent = 'Paste your API key first.'; return; }
 
-  // unlocks audio playback on iPhone
   speechSynthesis.cancel();
-  const prime = new SpeechSynthesisUtterance(' ');
-  prime.volume = 0;
-  speechSynthesis.speak(prime);
 
   const rec = new SR();
   rec.lang = langSel.value;
   rec.interimResults = false;
-  rec.onstart = () => { talk.classList.add('listening'); talk.textContent = 'Listening...'; $('status').textContent = ''; };
+  rec.onstart = () => { listening = true; talk.classList.add('listening'); talk.textContent = 'Listening...'; $('status').textContent = ''; };
   rec.onerror = e => { $('status').textContent = 'Mic error: ' + e.error; };
-  rec.onend = () => { talk.classList.remove('listening'); talk.textContent = 'Tap and ask'; };
+  rec.onend = () => { listening = false; talk.classList.remove('listening'); talk.textContent = 'Tap and ask'; };
   rec.onresult = async e => {
     const q = e.results[0][0].transcript;
     $('heard').textContent = q;
@@ -115,7 +115,64 @@ talk.addEventListener('click', () => {
       $('status').textContent = 'Error: ' + err.message;
     }
   };
-  rec.start();
+  try { rec.start(); } catch (err) { $('status').textContent = 'Could not start: ' + err.message; }
+}
+
+talk.addEventListener('click', () => {
+  // unlocks audio playback on iPhone
+  speechSynthesis.cancel();
+  const prime = new SpeechSynthesisUtterance(' ');
+  prime.volume = 0;
+  speechSynthesis.speak(prime);
+  startAsk();
+});
+
+// ---- AirPods click ----
+function silentWavUrl() {
+  const rate = 8000, n = rate;
+  const buf = new ArrayBuffer(44 + n);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  w(36, 'data'); v.setUint32(40, n, true);
+  for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+const keepAlive = new Audio();
+keepAlive.loop = true;
+
+function onAirPodsClick() {
+  keepAlive.play().catch(() => {});
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  $('status').textContent = 'AirPods click received';
+  startAsk();
+}
+
+enableBtn.addEventListener('click', async () => {
+  try {
+    // unlock speech output too
+    const prime = new SpeechSynthesisUtterance(' ');
+    prime.volume = 0;
+    speechSynthesis.speak(prime);
+
+    keepAlive.src = silentWavUrl();
+    await keepAlive.play();
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: 'AI Earbud', artist: 'Click to ask' });
+      navigator.mediaSession.playbackState = 'playing';
+      for (const action of ['play', 'pause', 'nexttrack', 'previoustrack']) {
+        try { navigator.mediaSession.setActionHandler(action, onAirPodsClick); } catch (e) {}
+      }
+    }
+    enableBtn.classList.add('on');
+    enableBtn.textContent = 'AirPods click is ON';
+    $('status').textContent = 'Press an AirPod stem once to ask.';
+  } catch (err) {
+    $('status').textContent = 'Could not turn on: ' + err.message;
+  }
 });
 </script>
 </body>
