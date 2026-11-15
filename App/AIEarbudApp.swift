@@ -4,6 +4,11 @@ import AVFoundation
 import Speech
 import MediaPlayer
 
+struct VoiceOption: Identifiable {
+    let id: String
+    let label: String
+}
+
 struct AppError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -14,6 +19,7 @@ final class Assistant: NSObject, ObservableObject {
     @Published var langCode: String { didSet { UserDefaults.standard.set(langCode, forKey: "lang") } }
     @Published var shortMode: Bool { didSet { UserDefaults.standard.set(shortMode, forKey: "short") } }
     @Published var mode: Int { didSet { UserDefaults.standard.set(mode, forKey: "mode") } }
+    @Published var voiceID: String { didSet { UserDefaults.standard.set(voiceID, forKey: "voiceid") } }
     @Published var heard = ""
     @Published var answer = ""
     @Published var status = "Tap Start, then press an AirPod stem once to ask."
@@ -55,6 +61,7 @@ final class Assistant: NSObject, ObservableObject {
         langCode = d.string(forKey: "lang") ?? "en-US"
         shortMode = d.object(forKey: "short") as? Bool ?? true
         mode = d.object(forKey: "mode") as? Int ?? 0
+        voiceID = d.string(forKey: "voiceid") ?? ""
         super.init()
     }
 
@@ -561,9 +568,68 @@ final class Assistant: NSObject, ObservableObject {
         }
     }
 
+    // MARK: Voice
+
+    private func qualityName(_ q: AVSpeechSynthesisVoiceQuality) -> String {
+        switch q {
+        case .premium: return "Premium"
+        case .enhanced: return "Enhanced"
+        default: return "Standard"
+        }
+    }
+
+    // Installed voices for the chosen language, best quality first.
+    // The old novelty and robot voices are left out.
+    func availableVoices() -> [VoiceOption] {
+        let prefix = String(langCode.prefix(2))
+        let list = AVSpeechSynthesisVoice.speechVoices().filter { v in
+            v.language.hasPrefix(prefix) && !v.identifier.hasPrefix("com.apple.speech.synthesis.voice.")
+        }
+        let sorted = list.sorted { a, b in
+            if a.quality.rawValue != b.quality.rawValue { return a.quality.rawValue > b.quality.rawValue }
+            return a.name < b.name
+        }
+        return sorted.map { v in
+            VoiceOption(id: v.identifier, label: "\(v.name) - \(v.language) - \(qualityName(v.quality))")
+        }
+    }
+
+    private func pickVoice() -> AVSpeechSynthesisVoice? {
+        let prefix = String(langCode.prefix(2))
+        if !voiceID.isEmpty,
+           let chosen = AVSpeechSynthesisVoice(identifier: voiceID),
+           chosen.language.hasPrefix(prefix) {
+            return chosen
+        }
+        let best = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language == langCode && !$0.identifier.hasPrefix("com.apple.speech.synthesis.voice.") }
+            .max { $0.quality.rawValue < $1.quality.rawValue }
+        return best ?? AVSpeechSynthesisVoice(language: langCode)
+    }
+
+    private func sampleText() -> String {
+        switch String(langCode.prefix(2)) {
+        case "ru": return "Привет! Вот так я звучу. Спрашивайте меня о чём угодно."
+        case "sv": return "Hej! Så här låter jag. Fråga mig vad som helst."
+        default: return "Hi! This is how I sound. Ask me anything you like."
+        }
+    }
+
+    func testVoice() {
+        if !running {
+            let s = AVAudioSession.sharedInstance()
+            try? s.setCategory(.playback, mode: .default, options: [])
+            try? s.setActive(true)
+        }
+        synth.stopSpeaking(at: .immediate)
+        speak(sampleText())
+    }
+
     private func speak(_ text: String) {
         let u = AVSpeechUtterance(string: text)
-        u.voice = AVSpeechSynthesisVoice(language: langCode)
+        u.voice = pickVoice()
+        u.rate = AVSpeechUtteranceDefaultSpeechRate
+        u.pitchMultiplier = 1.0
         synth.speak(u)
     }
 
@@ -640,6 +706,18 @@ struct ContentView: View {
                 }
                 .pickerStyle(.menu)
                 .disabled(a.running)
+
+                Text("Voice:").font(.caption).foregroundColor(.gray)
+                Picker("Voice", selection: $a.voiceID) {
+                    Text("Auto (best available)").tag("")
+                    ForEach(a.availableVoices()) { v in
+                        Text(v.label).tag(v.id)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Button("Test voice") { a.testVoice() }
+                    .buttonStyle(.bordered)
 
                 Button(a.running ? "Stop" : "Start") {
                     if a.running { a.stop() } else { a.start() }
