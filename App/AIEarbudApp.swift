@@ -3,6 +3,7 @@ import UIKit
 import AVFoundation
 import Speech
 import MediaPlayer
+import AudioToolbox
 
 struct AppError: LocalizedError {
     let message: String
@@ -41,9 +42,12 @@ final class Assistant: NSObject, ObservableObject {
     private var liveRequest: SFSpeechAudioBufferRecognitionRequest?
 
     // mode 0 = always-on mic using the iPhone mic, 1 = always-on mic using the AirPods mic,
-    // 2 = mic only while a question is being asked (AirPods mic)
+    // 2 = mic only while a question is being asked (AirPods mic),
+    // 3 = hybrid: iPhone mic while idle, AirPods mic only while a question is being asked
     private var keepMic: Bool { mode != 2 }
-    private var phoneMic: Bool { mode == 0 }
+    private var phoneMic: Bool { mode == 0 || mode == 3 }
+    private var hybrid: Bool { mode == 3 }
+    private var waitingForAirPods = false
 
     override init() {
         let d = UserDefaults.standard
@@ -134,8 +138,12 @@ final class Assistant: NSObject, ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 guard let self = self, self.running else { return }
                 if self.startEngine() {
-                    let which = self.phoneMic ? "iPhone mic" : "AirPods mic"
-                    self.status = "Ready (\(which) on, screen lock OK). Press an AirPod stem once to ask."
+                    if self.hybrid {
+                        self.status = "Ready (hybrid). Press the stem once, wait for the beep, then ask."
+                    } else {
+                        let which = self.phoneMic ? "iPhone mic" : "AirPods mic"
+                        self.status = "Ready (\(which) on, screen lock OK). Press an AirPod stem once to ask."
+                    }
                 }
             }
         } else {
@@ -144,6 +152,7 @@ final class Assistant: NSObject, ObservableObject {
     }
 
     func stop() {
+        waitingForAirPods = false
         silenceTimer?.invalidate()
         setCurrentRequest(nil)
         if listening {
@@ -168,6 +177,48 @@ final class Assistant: NSObject, ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         running = false
         status = "Stopped."
+    }
+
+    // MARK: AirPods connection and mic switching
+
+    private func bluetoothConnected() -> Bool {
+        let bt: [AVAudioSession.Port] = [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE]
+        return AVAudioSession.sharedInstance().currentRoute.outputs.contains { bt.contains($0.portType) }
+    }
+
+    // Hybrid mode: true = use the AirPods mic (call-style link), false = back to the iPhone mic.
+    private func applyHybrid(airpodsMic: Bool) {
+        do {
+            let s = AVAudioSession.sharedInstance()
+            let options: AVAudioSession.CategoryOptions = airpodsMic
+                ? [.allowBluetooth, .allowBluetoothA2DP]
+                : [.allowBluetoothA2DP]
+            try s.setCategory(.playAndRecord, mode: .default, options: options)
+            try s.setActive(true)
+            if airpodsMic {
+                if let bt = s.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+                    try s.setPreferredInput(bt)
+                } else {
+                    status = "AirPods mic not available."
+                }
+            } else if let b = s.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                try s.setPreferredInput(b)
+            }
+        } catch {
+            status = "Audio switch error: \(error.localizedDescription)"
+        }
+    }
+
+    private func restoreIdle() {
+        guard running else { return }
+        if keepMic { setCaptureMode() } else { setPlaybackMode() }
+        if keepMic && !engine.isRunning {
+            if startEngine() {
+                status = "AirPods back. Ready. Press the stem once to ask."
+            }
+        } else {
+            status = "AirPods back. Ready. Press the stem once to ask."
+        }
     }
 
     // MARK: Microphone engine
@@ -285,13 +336,20 @@ final class Assistant: NSObject, ObservableObject {
     @objc private func routeChanged(_ n: Notification) {
         guard running,
               let v = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
-              AVAudioSession.RouteChangeReason(rawValue: v) == .oldDeviceUnavailable else { return }
-        let bt: [AVAudioSession.Port] = [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE]
-        let stillBT = AVAudioSession.sharedInstance().currentRoute.outputs.contains { bt.contains($0.portType) }
-        if !stillBT {
+              let reason = AVAudioSession.RouteChangeReason(rawValue: v) else { return }
+        if reason == .oldDeviceUnavailable {
             DispatchQueue.main.async {
-                self.stop()
-                self.status = "AirPods removed. Stopped."
+                if !self.bluetoothConnected() {
+                    self.waitingForAirPods = true
+                    self.status = "AirPods not connected (out of range?). Waiting for them..."
+                }
+            }
+        } else if reason == .newDeviceAvailable {
+            DispatchQueue.main.async {
+                if self.waitingForAirPods && self.bluetoothConnected() {
+                    self.waitingForAirPods = false
+                    self.restoreIdle()
+                }
             }
         }
     }
@@ -300,6 +358,11 @@ final class Assistant: NSObject, ObservableObject {
 
     func trigger() {
         if starting || thinking { return }
+        if !bluetoothConnected() {
+            waitingForAirPods = true
+            status = "AirPods not connected. Waiting for them..."
+            return
+        }
         if synth.isSpeaking {
             synth.stopSpeaking(at: .immediate)
             return
@@ -328,6 +391,15 @@ final class Assistant: NSObject, ObservableObject {
                 status = "Microphone is not running. Open the app, tap Stop, then Start."
                 return
             }
+            if hybrid {
+                starting = true
+                status = "Switching to AirPods mic..."
+                applyHybrid(airpodsMic: true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                    self?.beginHybridCapture(with: rec)
+                }
+                return
+            }
             let req = makeRequest()
             beginRecognition(with: rec, req: req)
             return
@@ -347,6 +419,20 @@ final class Assistant: NSObject, ObservableObject {
         request = req
         setCurrentRequest(req)
         return req
+    }
+
+    private func beginHybridCapture(with rec: SFSpeechRecognizer) {
+        starting = false
+        guard running else { return }
+        if !engine.isRunning {
+            if !startEngine() {
+                applyHybrid(airpodsMic: false)
+                return
+            }
+        }
+        let req = makeRequest()
+        AudioServicesPlaySystemSound(1113)
+        beginRecognition(with: rec, req: req)
     }
 
     private func beginCapture(with rec: SFSpeechRecognizer) {
@@ -395,6 +481,8 @@ final class Assistant: NSObject, ObservableObject {
         if !keepMic {
             stopEngine()
             setPlaybackMode()
+        } else if hybrid {
+            applyHybrid(airpodsMic: false)
         }
         let q = latestText.trimmingCharacters(in: .whitespacesAndNewlines)
         if q.isEmpty {
@@ -497,7 +585,8 @@ struct ContentView: View {
 
                 Text("Mode (change before Start):").font(.caption).foregroundColor(.gray)
                 Picker("Mode", selection: $a.mode) {
-                    Text("Always-on, iPhone mic (stem may work)").tag(0)
+                    Text("Hybrid: phone mic idle, AirPods mic on press (new)").tag(3)
+                    Text("Always-on, iPhone mic only (phone must be near)").tag(0)
                     Text("Always-on, AirPods mic (stem gives tone)").tag(1)
                     Text("Mic only on press, AirPods mic (screen on)").tag(2)
                 }
