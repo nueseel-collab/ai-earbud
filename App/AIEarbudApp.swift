@@ -20,6 +20,8 @@ final class Assistant: NSObject, ObservableObject {
     @Published var shortMode: Bool { didSet { UserDefaults.standard.set(shortMode, forKey: "short") } }
     @Published var mode: Int { didSet { UserDefaults.standard.set(mode, forKey: "mode") } }
     @Published var voiceID: String { didSet { UserDefaults.standard.set(voiceID, forKey: "voiceid") } }
+    @Published var city: String { didSet { UserDefaults.standard.set(city, forKey: "city") } }
+    @Published var tavilyKey: String { didSet { UserDefaults.standard.set(tavilyKey, forKey: "tkey") } }
     @Published var heard = ""
     @Published var answer = ""
     @Published var status = "Tap Start, then press an AirPod stem once to ask."
@@ -62,6 +64,8 @@ final class Assistant: NSObject, ObservableObject {
         shortMode = d.object(forKey: "short") as? Bool ?? true
         mode = d.object(forKey: "mode") as? Int ?? 0
         voiceID = d.string(forKey: "voiceid") ?? ""
+        city = d.string(forKey: "city") ?? ""
+        tavilyKey = d.string(forKey: "tkey") ?? ""
         super.init()
     }
 
@@ -633,14 +637,144 @@ final class Assistant: NSObject, ObservableObject {
         synth.speak(u)
     }
 
-    private func callGemini(_ question: String) async throws -> String {
-        let rules = " Rules: (1) When asked what a word or thing means, start with the plain dictionary-style meaning, then add a short example only if it helps. (2) The user's text comes from speech recognition and can contain mishearings. If a phrase looks odd or does not make sense, say you may have misheard and ask them to repeat, instead of guessing. (3) If the user states something that is wrong, politely correct it. Never agree just to be agreeable, and never open with praise like 'spot on' or 'great question'. (4) You have no internet access, so you cannot know live information like weather, news, prices or scores. If asked, say plainly that you can't check that live. (5) Never invent facts. If you are not sure, say so. Today is \(Date().formatted())."
-        let shortStyle = "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown, no links. Reply in the language the user speaks."
-        let fullStyle = "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, no links, because your answer is read aloud. Reply in the language the user speaks."
-        let system = (shortMode ? shortStyle : fullStyle) + rules
+    // MARK: Live information (weather and web search)
 
-        var contents = history
-        contents.append(["role": "user", "parts": [["text": question]]])
+    private func trimmed(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func fetchJSON(_ url: URL, post body: [String: Any]? = nil, bearer: String? = nil) async throws -> [String: Any] {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 15
+        if let body = body {
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "content-type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        if let b = bearer {
+            req.setValue("Bearer \(b)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AppError(message: "Unreadable response")
+        }
+        return json
+    }
+
+    private func weatherText(_ code: Int) -> String {
+        switch code {
+        case 0: return "clear sky"
+        case 1: return "mostly clear"
+        case 2: return "partly cloudy"
+        case 3: return "overcast"
+        case 45, 48: return "fog"
+        case 51, 53, 55: return "drizzle"
+        case 56, 57: return "freezing drizzle"
+        case 61, 63, 65: return "rain"
+        case 66, 67: return "freezing rain"
+        case 71, 73, 75, 77: return "snow"
+        case 80, 81, 82: return "rain showers"
+        case 85, 86: return "snow showers"
+        case 95, 96, 99: return "thunderstorm"
+        default: return "unknown conditions"
+        }
+    }
+
+    // Free weather data from Open-Meteo (no key needed).
+    private func weatherSummary(city: String) async throws -> String {
+        var g = URLComponents(string: "https://geocoding-api.open-meteo.com/v1/search")!
+        g.queryItems = [
+            URLQueryItem(name: "name", value: city),
+            URLQueryItem(name: "count", value: "1"),
+            URLQueryItem(name: "language", value: "en"),
+            URLQueryItem(name: "format", value: "json")
+        ]
+        let geo = try await fetchJSON(g.url!)
+        guard let r = (geo["results"] as? [[String: Any]])?.first,
+              let lat = (r["latitude"] as? NSNumber)?.doubleValue,
+              let lon = (r["longitude"] as? NSNumber)?.doubleValue else {
+            return "No place named \(city) was found."
+        }
+        let place = [r["name"] as? String, r["country"] as? String].compactMap { $0 }.joined(separator: ", ")
+
+        var f = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
+        f.queryItems = [
+            URLQueryItem(name: "latitude", value: String(lat)),
+            URLQueryItem(name: "longitude", value: String(lon)),
+            URLQueryItem(name: "current", value: "temperature_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m"),
+            URLQueryItem(name: "daily", value: "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"),
+            URLQueryItem(name: "timezone", value: "auto"),
+            URLQueryItem(name: "forecast_days", value: "3")
+        ]
+        let w = try await fetchJSON(f.url!)
+        let cur = w["current"] as? [String: Any] ?? [:]
+        let daily = w["daily"] as? [String: Any] ?? [:]
+
+        func num(_ any: Any?) -> Double? { (any as? NSNumber)?.doubleValue }
+        func nums(_ any: Any?) -> [Double?] {
+            ((any as? [Any]) ?? []).map { ($0 as? NSNumber)?.doubleValue }
+        }
+
+        var lines: [String] = []
+        var now = "Weather for \(place). Right now:"
+        if let c = num(cur["weather_code"]) { now += " \(weatherText(Int(c)))," }
+        if let t = num(cur["temperature_2m"]) { now += " \(Int(t.rounded())) degrees Celsius" }
+        if let a = num(cur["apparent_temperature"]) { now += " (feels like \(Int(a.rounded())))" }
+        if let wind = num(cur["wind_speed_10m"]) { now += ", wind \(Int(wind.rounded())) km/h" }
+        if let p = num(cur["precipitation"]), p > 0 { now += ", precipitation \(p) mm" }
+        lines.append(now)
+
+        let days = (daily["time"] as? [String]) ?? []
+        let maxT = nums(daily["temperature_2m_max"])
+        let minT = nums(daily["temperature_2m_min"])
+        let rain = nums(daily["precipitation_probability_max"])
+        let codes = nums(daily["weather_code"])
+        let labels = ["Today", "Tomorrow", "In two days"]
+        for i in 0..<min(days.count, 3) {
+            var s = "\(labels[i]):"
+            if i < codes.count, let c = codes[i] { s += " \(weatherText(Int(c)))," }
+            if i < minT.count, let lo = minT[i], i < maxT.count, let hi = maxT[i] {
+                s += " low \(Int(lo.rounded())), high \(Int(hi.rounded())) degrees"
+            }
+            if i < rain.count, let p = rain[i] { s += ", chance of rain or snow \(Int(p.rounded())) percent" }
+            lines.append(s)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // Web search through Tavily (needs the free key from the settings).
+    private func webSearch(_ query: String) async throws -> String {
+        let url = URL(string: "https://api.tavily.com/search")!
+        let body: [String: Any] = [
+            "query": query,
+            "search_depth": "basic",
+            "max_results": 3,
+            "include_answer": true
+        ]
+        let json = try await fetchJSON(url, post: body, bearer: trimmed(tavilyKey))
+        if let detail = json["detail"] as? [String: Any], let m = detail["error"] as? String {
+            throw AppError(message: m)
+        }
+        if let detail = json["detail"] as? String {
+            throw AppError(message: detail)
+        }
+        var lines: [String] = []
+        if let a = json["answer"] as? String, !a.isEmpty {
+            lines.append("Summary: \(a)")
+        }
+        if let results = json["results"] as? [[String: Any]] {
+            for r in results.prefix(3) {
+                let title = r["title"] as? String ?? ""
+                let content = r["content"] as? String ?? ""
+                lines.append("- \(title): \(String(content.prefix(400)))")
+            }
+        }
+        return lines.isEmpty ? "No results found." : lines.joined(separator: "\n")
+    }
+
+    // MARK: Asking the AI
+
+    private func generate(system: String, contents: [[String: Any]]) async throws -> String {
         let body: [String: Any] = [
             "systemInstruction": ["parts": [["text": system]]],
             "contents": contents,
@@ -651,7 +785,7 @@ final class Assistant: NSObject, ObservableObject {
         req.httpMethod = "POST"
         req.timeoutInterval = 30
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.setValue(apiKey.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "x-goog-api-key")
+        req.setValue(trimmed(apiKey), forHTTPHeaderField: "x-goog-api-key")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, _) = try await URLSession.shared.data(for: req)
@@ -665,13 +799,64 @@ final class Assistant: NSObject, ObservableObject {
         let content = candidates?.first?["content"] as? [String: Any]
         let parts = content?["parts"] as? [[String: Any]] ?? []
         let text = parts.compactMap { $0["text"] as? String }.joined(separator: " ")
+        let clean = trimmed(text)
+        return clean.isEmpty ? "(no answer)" : clean
+    }
+
+    private func callGemini(_ question: String) async throws -> String {
+        let tavilyOn = !trimmed(tavilyKey).isEmpty
+        let cityText = trimmed(city).isEmpty ? "unknown" : trimmed(city)
+        let shortStyle = "You are a friendly voice assistant in the user's earbud while they talk to someone. Answer in one or two short sentences. No lists, no markdown, no links. Reply in the language the user speaks."
+        let fullStyle = "You are a friendly voice assistant in the user's earbud. Explain clearly and fully, like a patient guide. No lists, no markdown, no links, because your answer is read aloud. Reply in the language the user speaks."
+        let style = shortMode ? shortStyle : fullStyle
+
+        let baseRules = " Rules: (1) When asked what a word or thing means, start with the plain dictionary-style meaning, then add a short example only if it helps. (2) The user's text comes from speech recognition and can contain mishearings. If a phrase looks odd or does not make sense, say you may have misheard and ask them to repeat, instead of guessing. (3) If the user states something that is wrong, politely correct it. Never agree just to be agreeable, and never open with praise like 'spot on' or 'great question'. (5) Never invent facts. If you are not sure, say so. Today is \(Date().formatted()). The user's city is \(cityText)."
+
+        let lookupRule: String
+        if tavilyOn {
+            lookupRule = " (4) You have no direct internet access. If the question needs live or very recent information (weather, news, scores, prices, current events, who currently holds a position), do NOT answer from memory. Reply with exactly one line and nothing else: 'WEATHER: <city>' for weather (use the user's city if they did not name one), or 'SEARCH: <short web search query in English>' for anything else live."
+        } else {
+            lookupRule = " (4) You have no direct internet access. If the question needs live or very recent information (news, scores, prices, current events), say plainly that you can't check that live. For weather, reply with exactly one line and nothing else: 'WEATHER: <city>' (use the user's city if they did not name one)."
+        }
+
+        var contents = history
+        contents.append(["role": "user", "parts": [["text": question]]])
+
+        let first = try await generate(system: style + baseRules + lookupRule, contents: contents)
+        let firstLine = (first.components(separatedBy: "\n").first ?? first)
+            .replacingOccurrences(of: "`", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let answerText = text.isEmpty ? "(no answer)" : text
+        let upper = firstLine.uppercased()
+        let wantsWeather = upper.hasPrefix("WEATHER:")
+        let wantsSearch = tavilyOn && upper.hasPrefix("SEARCH:")
+
+        var finalText = first
+        if wantsWeather || wantsSearch {
+            await MainActor.run { self.status = "Looking it up..." }
+            let argument = trimmed(String(firstLine.dropFirst(wantsWeather ? 8 : 7)))
+            var data = ""
+            do {
+                if wantsWeather {
+                    data = try await weatherSummary(city: argument.isEmpty ? cityText : argument)
+                } else {
+                    data = try await webSearch(argument)
+                }
+            } catch {
+                data = "The lookup failed: \(error.localizedDescription)"
+            }
+
+            let afterRule = " (4) Live data from a lookup is provided in the conversation. Use it to answer. If it does not contain the answer, say so plainly. Never read out links and never mention that you searched."
+            var contents2 = history
+            contents2.append(["role": "user", "parts": [["text": question]]])
+            contents2.append(["role": "model", "parts": [["text": firstLine]]])
+            contents2.append(["role": "user", "parts": [["text": "Live data (may be imperfect):\n\(data)\n\nUsing this data, answer my last question briefly in plain spoken language, in the language I spoke."]]])
+            finalText = try await generate(system: style + baseRules + afterRule, contents: contents2)
+        }
 
         history.append(["role": "user", "parts": [["text": question]]])
-        history.append(["role": "model", "parts": [["text": answerText]]])
+        history.append(["role": "model", "parts": [["text": finalText]]])
         if history.count > 12 { history.removeFirst(2) }
-        return answerText
+        return finalText
     }
 }
 
@@ -684,6 +869,15 @@ struct ContentView: View {
                 Text("AI Earbud").font(.largeTitle).bold()
 
                 SecureField("Gemini API key", text: $a.apiKey)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                TextField("My city, for weather (e.g. Stockholm)", text: $a.city)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+
+                SecureField("Tavily key (optional, for news and other live info)", text: $a.tavilyKey)
                     .textFieldStyle(.roundedBorder)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
