@@ -3,7 +3,6 @@ import UIKit
 import AVFoundation
 import Speech
 import MediaPlayer
-import AudioToolbox
 
 struct AppError: LocalizedError {
     let message: String
@@ -27,6 +26,7 @@ final class Assistant: NSObject, ObservableObject {
     private let synth = AVSpeechSynthesizer()
     private var engine = AVAudioEngine()
     private var player: AVAudioPlayer?
+    private var beepPlayer: AVAudioPlayer?
     private var recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
@@ -288,6 +288,39 @@ final class Assistant: NSObject, ObservableObject {
         }
     }
 
+    // A short tone played through the app's own audio, so it reaches the AirPods.
+    private func beepWav(freq: Double) -> Data {
+        let rate = 16000
+        let count = rate * 15 / 100
+        let bytes = count * 2
+        var d = Data()
+        func u32(_ v: UInt32) { d.append(contentsOf: withUnsafeBytes(of: v.littleEndian) { Array($0) }) }
+        func u16(_ v: UInt16) { d.append(contentsOf: withUnsafeBytes(of: v.littleEndian) { Array($0) }) }
+        d.append("RIFF".data(using: .ascii)!); u32(UInt32(36 + bytes))
+        d.append("WAVE".data(using: .ascii)!)
+        d.append("fmt ".data(using: .ascii)!); u32(16); u16(1); u16(1)
+        u32(UInt32(rate)); u32(UInt32(rate * 2)); u16(2); u16(16)
+        d.append("data".data(using: .ascii)!); u32(UInt32(bytes))
+        for i in 0..<count {
+            let t = Double(i) / Double(rate)
+            let fade = min(1.0, Double(i) / 160.0, Double(count - i) / 160.0)
+            let v = sin(2.0 * Double.pi * freq * t) * 0.6 * fade
+            u16(UInt16(bitPattern: Int16(v * 32767)))
+        }
+        return d
+    }
+
+    private func playBeep(freq: Double) {
+        do {
+            beepPlayer = try AVAudioPlayer(data: beepWav(freq: freq))
+            beepPlayer?.volume = 1.0
+            beepPlayer?.prepareToPlay()
+            beepPlayer?.play()
+        } catch {
+            // If the tone cannot play, the app still works; there is just no cue.
+        }
+    }
+
     private func setupRemote() {
         let c = MPRemoteCommandCenter.shared()
         let all: [(MPRemoteCommand, String)] = [
@@ -422,17 +455,27 @@ final class Assistant: NSObject, ObservableObject {
     }
 
     private func beginHybridCapture(with rec: SFSpeechRecognizer) {
-        starting = false
-        guard running else { return }
+        guard running else {
+            starting = false
+            return
+        }
         if !engine.isRunning {
             if !startEngine() {
+                starting = false
                 applyHybrid(airpodsMic: false)
                 return
             }
         }
-        let req = makeRequest()
-        AudioServicesPlaySystemSound(1113)
-        beginRecognition(with: rec, req: req)
+        status = "Beep, then speak..."
+        playBeep(freq: 880)
+        // Wait for the beep to finish so it is not picked up as speech.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self = self else { return }
+            self.starting = false
+            guard self.running else { return }
+            let req = self.makeRequest()
+            self.beginRecognition(with: rec, req: req)
+        }
     }
 
     private func beginCapture(with rec: SFSpeechRecognizer) {
@@ -492,6 +535,11 @@ final class Assistant: NSObject, ObservableObject {
         status = "Thinking..."
         answer = "..."
         thinking = true
+        if hybrid {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                self?.playBeep(freq: 600)
+            }
+        }
         Task { await respond(q) }
     }
 
