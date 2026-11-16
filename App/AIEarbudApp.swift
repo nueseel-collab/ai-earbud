@@ -22,6 +22,7 @@ final class Assistant: NSObject, ObservableObject {
     @Published var voiceID: String { didSet { UserDefaults.standard.set(voiceID, forKey: "voiceid") } }
     @Published var city: String { didSet { UserDefaults.standard.set(city, forKey: "city") } }
     @Published var tavilyKey: String { didSet { UserDefaults.standard.set(tavilyKey, forKey: "tkey") } }
+    @Published var autoStart: Bool { didSet { UserDefaults.standard.set(autoStart, forKey: "autostart") } }
     @Published var heard = ""
     @Published var answer = ""
     @Published var status = "Tap Start, then press an AirPod stem once to ask."
@@ -56,6 +57,7 @@ final class Assistant: NSObject, ObservableObject {
     private var phoneMic: Bool { mode == 0 || mode == 3 }
     private var hybrid: Bool { mode == 3 }
     private var waitingForAirPods = false
+    private var didAutoStart = false
 
     override init() {
         let d = UserDefaults.standard
@@ -66,6 +68,7 @@ final class Assistant: NSObject, ObservableObject {
         voiceID = d.string(forKey: "voiceid") ?? ""
         city = d.string(forKey: "city") ?? ""
         tavilyKey = d.string(forKey: "tkey") ?? ""
+        autoStart = d.object(forKey: "autostart") as? Bool ?? true
         super.init()
     }
 
@@ -101,6 +104,14 @@ final class Assistant: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    // Called when the app opens: press Start automatically, once per launch.
+    func autoStartIfNeeded() {
+        guard autoStart, !didAutoStart, !running else { return }
+        didAutoStart = true
+        status = "Auto-starting..."
+        start()
     }
 
     private func setPlaybackMode() {
@@ -891,6 +902,8 @@ struct ContentView: View {
 
                 Toggle("Short answers (in a conversation)", isOn: $a.shortMode)
 
+                Toggle("Auto-start when the app opens", isOn: $a.autoStart)
+
                 Text("Mode (change before Start):").font(.caption).foregroundColor(.gray)
                 Picker("Mode", selection: $a.mode) {
                     Text("Hybrid: phone mic idle, AirPods mic on press (new)").tag(3)
@@ -944,6 +957,7 @@ struct ContentView: View {
             }
             .padding()
         }
+        .onAppear { a.autoStartIfNeeded() }
     }
 }
 
